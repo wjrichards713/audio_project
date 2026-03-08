@@ -82,7 +82,7 @@ static void printHelp() {
     printf("\n");
     printf("Commands:\n");
     printf("  connect <host> [udp_port] [ws_port] [token]\n");
-    printf("      Connect to server (default ports: 7000 UDP, 7001 WS)\n");
+    printf("      Connect to server (default ports: 10000 UDP, 8080 WS)\n");
     printf("  disconnect\n");
     printf("      Disconnect from server\n");
     printf("  join <1|2|3>\n");
@@ -203,8 +203,8 @@ int main(int /*argc*/, char * /*argv*/[]) {
                 printf("Usage: connect <host> [udp_port] [ws_port] [token]\n");
                 continue;
             }
-            int udpPort = arg2[0] ? atoi(arg2) : 7000;
-            int wsPort = arg3[0] ? atoi(arg3) : 7001;
+            int udpPort = arg2[0] ? atoi(arg2) : 10000;
+            int wsPort = arg3[0] ? atoi(arg3) : 8080;
             const char *token = arg4[0] ? arg4 : "test-token";
 
             printf("Connecting to %s (UDP:%d WS:%d)...\n", arg1, udpPort, wsPort);
