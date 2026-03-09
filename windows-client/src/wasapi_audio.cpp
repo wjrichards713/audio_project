@@ -72,7 +72,7 @@ int WasapiAudio::openRenderDevice() {
 
     hr = renderClient_->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST,
+        AUDCLNT_STREAMFLAGS_NOPERSIST,
         duration, 0,
         (WAVEFORMATEX *)&wfx, nullptr
     );

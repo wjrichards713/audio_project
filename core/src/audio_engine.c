@@ -30,6 +30,7 @@
 #define CAPTURE_RING_FRAMES   64   /* ~1.3 seconds of capture buffer */
 #define PLAYBACK_RING_FRAMES  64   /* ~1.3 seconds of playback buffer */
 #define KEEPALIVE_INTERVAL_MS 5000
+#define PING_INTERVAL_MS      2000 /* RTT ping every 2 seconds */
 #define MAX_RECV_PER_TICK     20   /* max packets to process per tick */
 
 /* ─── Remote stream state ─────────────────────────────────────────── */
@@ -119,6 +120,10 @@ struct ae_engine {
 
     /* Keepalive timer */
     uint64_t last_keepalive_ms;
+
+    /* RTT ping timer */
+    uint64_t last_ping_ms;
+    uint64_t ping_send_time_ms;  /* timestamp when last ping was sent */
 
     /* Master volume */
     float master_volume;
@@ -363,7 +368,20 @@ ae_error_t ae_engine_connect(ae_engine_t *engine, const char *server_host,
         return AE_ERR_NETWORK;
 
     atomic_store(&engine->connected, true);
-    engine->last_keepalive_ms = ae_net_time_ms();
+
+    /* Send an immediate keepalive so the server learns our UDP address */
+    {
+        uint64_t now = ae_net_time_ms();
+        uint8_t ka_buf[AE_RTP_HEADER_SIZE];
+        int ka_len = ae_rtp_build_keepalive(
+            engine->server_id, 0, engine->client_id,
+            ka_buf, sizeof(ka_buf)
+        );
+        if (ka_len > 0)
+            ae_net_send(engine->network, ka_buf, ka_len);
+        engine->last_keepalive_ms = now;
+        engine->last_ping_ms = now;
+    }
 
     /* Fire event */
     if (engine->event_cb) {
@@ -690,9 +708,15 @@ void ae_engine_process(ae_engine_t *engine)
                 /* Server keepalive -- nothing to do */
                 break;
 
-            case AE_RTP_TYPE_PONG:
-                /* RTT measurement: could extract timestamp from payload */
+            case AE_RTP_TYPE_PONG: {
+                /* RTT measurement: compute from send timestamp */
+                uint64_t now_pong = ae_net_time_ms();
+                if (engine->ping_send_time_ms > 0) {
+                    engine->rtt_ms = (float)(now_pong - engine->ping_send_time_ms);
+                    engine->ping_send_time_ms = 0;
+                }
                 break;
+            }
 
             default:
                 break;
@@ -714,6 +738,23 @@ void ae_engine_process(ae_engine_t *engine)
                 ae_net_send(engine->network, ka_buf, ka_len);
 
             engine->last_keepalive_ms = now;
+        }
+
+        /* ── Step 3b: Send RTT ping if needed ─────────────────────── */
+
+        if (now - engine->last_ping_ms >= PING_INTERVAL_MS) {
+            uint8_t ping_buf[AE_RTP_HEADER_SIZE + 8];
+            int ping_len = ae_rtp_build_ping(
+                engine->server_id,
+                engine->client_id,
+                now,
+                ping_buf, sizeof(ping_buf)
+            );
+            if (ping_len > 0) {
+                ae_net_send(engine->network, ping_buf, ping_len);
+                engine->ping_send_time_ms = now;
+            }
+            engine->last_ping_ms = now;
         }
     }
 
