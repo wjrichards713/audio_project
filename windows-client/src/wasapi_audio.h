@@ -50,7 +50,7 @@ private:
     UINT32 renderBufferSize_ = 0;
     UINT32 captureBufferSize_ = 0;
 
-    // Capture format info (device may not support float32)
+    // Capture format info (always 48kHz stereo float32 with AUTOCONVERTPCM)
     UINT32 captureSampleRate_ = 0;
     UINT32 captureChannels_ = 0;
     UINT32 captureBitsPerSample_ = 0;
@@ -60,7 +60,6 @@ private:
     int openRenderDevice();
     int openCaptureDevice();
     void audioLoop();
-    void convertCaptureToFloat(const BYTE *src, float *dst, UINT32 frames);
     void cleanup();
 };
 

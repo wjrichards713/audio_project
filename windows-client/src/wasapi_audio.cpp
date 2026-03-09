@@ -1,7 +1,7 @@
 /**
  * wasapi_audio.cpp - Windows WASAPI audio I/O
  *
- * Uses WASAPI in shared mode with event-driven callbacks.
+ * Uses WASAPI in shared mode with AUTOCONVERTPCM.
  * 48kHz float32 stereo to match the engine's format.
  */
 
@@ -11,9 +11,11 @@
 #include <functiondiscoverykeys_devpkey.h>
 #include <cstring>
 #include <cstdio>
+#include <timeapi.h>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "uuid.lib")
+#pragma comment(lib, "winmm.lib")
 
 // WASAPI reference time units (100-nanosecond intervals)
 #define REFTIMES_PER_SEC  10000000
@@ -67,12 +69,13 @@ int WasapiAudio::openRenderDevice() {
     wfx.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
     wfx.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 
-    // 20ms buffer (matches our frame size)
-    REFERENCE_TIME duration = AE_FRAME_DURATION_MS * REFTIMES_PER_MILLISEC * 2;
+    // Use AUTOCONVERTPCM so WASAPI handles any format mismatch with the device
+    REFERENCE_TIME duration = AE_FRAME_DURATION_MS * REFTIMES_PER_MILLISEC * 4;
 
     hr = renderClient_->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_NOPERSIST,
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+            | AUDCLNT_STREAMFLAGS_NOPERSIST,
         duration, 0,
         (WAVEFORMATEX *)&wfx, nullptr
     );
@@ -87,7 +90,7 @@ int WasapiAudio::openRenderDevice() {
     hr = renderClient_->GetService(__uuidof(IAudioRenderClient), (void **)&renderService_);
     if (FAILED(hr)) return -1;
 
-    printf("Render device opened: buffer=%u frames\n", renderBufferSize_);
+    printf("Render device opened: buffer=%u frames (AUTOCONVERTPCM)\n", renderBufferSize_);
     return 0;
 }
 
@@ -101,45 +104,41 @@ int WasapiAudio::openCaptureDevice() {
     hr = captureDevice_->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void **)&captureClient_);
     if (FAILED(hr)) return -1;
 
-    // Use the device's preferred mix format (shared mode requires this)
-    WAVEFORMATEX *mixFormat = nullptr;
-    hr = captureClient_->GetMixFormat(&mixFormat);
-    if (FAILED(hr)) {
-        fprintf(stderr, "Failed to get capture mix format: 0x%lx\n", hr);
-        return -1;
-    }
+    // Request 48kHz stereo float32 -- same as engine format.
+    // AUTOCONVERTPCM tells WASAPI to handle any sample rate / format
+    // conversion automatically, so we don't need manual conversion.
+    WAVEFORMATEXTENSIBLE wfx = {};
+    wfx.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    wfx.Format.nChannels = AE_CHANNELS;
+    wfx.Format.nSamplesPerSec = AE_SAMPLE_RATE;
+    wfx.Format.wBitsPerSample = 32;
+    wfx.Format.nBlockAlign = wfx.Format.nChannels * wfx.Format.wBitsPerSample / 8;
+    wfx.Format.nAvgBytesPerSec = wfx.Format.nSamplesPerSec * wfx.Format.nBlockAlign;
+    wfx.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+    wfx.Samples.wValidBitsPerSample = 32;
+    wfx.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+    wfx.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 
-    // Store format info for runtime conversion
-    captureSampleRate_ = mixFormat->nSamplesPerSec;
-    captureChannels_ = mixFormat->nChannels;
-    captureBitsPerSample_ = mixFormat->wBitsPerSample;
-    captureIsFloat_ = false;
-
-    if (mixFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
-        captureIsFloat_ = true;
-    } else if (mixFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
-        WAVEFORMATEXTENSIBLE *wfxe = (WAVEFORMATEXTENSIBLE *)mixFormat;
-        if (IsEqualGUID(wfxe->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) {
-            captureIsFloat_ = true;
-        }
-    }
-
-    printf("Capture device format: %uHz, %uch, %ubit, %s\n",
-           captureSampleRate_, captureChannels_, captureBitsPerSample_,
-           captureIsFloat_ ? "float" : "int");
-
-    REFERENCE_TIME duration = AE_FRAME_DURATION_MS * REFTIMES_PER_MILLISEC * 2;
+    REFERENCE_TIME duration = AE_FRAME_DURATION_MS * REFTIMES_PER_MILLISEC * 4;
 
     hr = captureClient_->Initialize(
-        AUDCLNT_SHAREMODE_SHARED, 0,
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
         duration, 0,
-        mixFormat, nullptr
+        (WAVEFORMATEX *)&wfx, nullptr
     );
-    CoTaskMemFree(mixFormat);
     if (FAILED(hr)) {
         fprintf(stderr, "Failed to init capture client: 0x%lx\n", hr);
         return -1;
     }
+
+    // Format is now always 48kHz stereo float32
+    captureSampleRate_ = AE_SAMPLE_RATE;
+    captureChannels_ = AE_CHANNELS;
+    captureBitsPerSample_ = 32;
+    captureIsFloat_ = true;
+
+    printf("Capture device opened: 48kHz stereo float32 (AUTOCONVERTPCM)\n");
 
     hr = captureClient_->GetBufferSize(&captureBufferSize_);
     if (FAILED(hr)) return -1;
@@ -147,63 +146,7 @@ int WasapiAudio::openCaptureDevice() {
     hr = captureClient_->GetService(__uuidof(IAudioCaptureClient), (void **)&captureService_);
     if (FAILED(hr)) return -1;
 
-    printf("Capture device opened: buffer=%u frames\n", captureBufferSize_);
     return 0;
-}
-
-void WasapiAudio::convertCaptureToFloat(const BYTE *src, float *dst, UINT32 frames) {
-    UINT32 totalSamples = frames * captureChannels_;
-    UINT32 outSamples = frames * AE_CHANNELS;
-
-    if (captureIsFloat_ && captureBitsPerSample_ == 32) {
-        // Float32 source -- just handle channel mapping
-        const float *fsrc = (const float *)src;
-        if (captureChannels_ == AE_CHANNELS) {
-            memcpy(dst, fsrc, outSamples * sizeof(float));
-        } else {
-            // Downmix or upmix to stereo
-            for (UINT32 f = 0; f < frames; f++) {
-                if (captureChannels_ >= 2) {
-                    dst[f * 2 + 0] = fsrc[f * captureChannels_ + 0];
-                    dst[f * 2 + 1] = fsrc[f * captureChannels_ + 1];
-                } else {
-                    dst[f * 2 + 0] = fsrc[f * captureChannels_];
-                    dst[f * 2 + 1] = fsrc[f * captureChannels_];
-                }
-            }
-        }
-    } else if (captureBitsPerSample_ == 16) {
-        // 16-bit PCM source
-        const short *ssrc = (const short *)src;
-        for (UINT32 f = 0; f < frames; f++) {
-            if (captureChannels_ >= 2) {
-                dst[f * 2 + 0] = ssrc[f * captureChannels_ + 0] / 32768.0f;
-                dst[f * 2 + 1] = ssrc[f * captureChannels_ + 1] / 32768.0f;
-            } else {
-                float s = ssrc[f * captureChannels_] / 32768.0f;
-                dst[f * 2 + 0] = s;
-                dst[f * 2 + 1] = s;
-            }
-        }
-    } else if (captureBitsPerSample_ == 24) {
-        // 24-bit PCM source (packed 3 bytes per sample)
-        for (UINT32 f = 0; f < frames; f++) {
-            for (UINT32 c = 0; c < (captureChannels_ < 2 ? 1u : 2u); c++) {
-                UINT32 srcIdx = (f * captureChannels_ + c) * 3;
-                int32_t sample = (int32_t)((src[srcIdx] << 8) | (src[srcIdx + 1] << 16) | (src[srcIdx + 2] << 24)) >> 8;
-                float val = sample / 8388608.0f;
-                if (c == 0 || captureChannels_ >= 2) {
-                    dst[f * 2 + c] = val;
-                }
-            }
-            if (captureChannels_ < 2) {
-                dst[f * 2 + 1] = dst[f * 2 + 0];
-            }
-        }
-    } else {
-        // Unsupported format, output silence
-        memset(dst, 0, outSamples * sizeof(float));
-    }
 }
 
 int WasapiAudio::start() {
@@ -213,8 +156,19 @@ int WasapiAudio::start() {
     if (openRenderDevice() != 0) return -1;
     if (openCaptureDevice() != 0) return -1;
 
-    renderClient_->Start();
-    captureClient_->Start();
+    // Set 1ms timer resolution for accurate Sleep()
+    timeBeginPeriod(1);
+
+    HRESULT hr = renderClient_->Start();
+    if (FAILED(hr)) {
+        fprintf(stderr, "Render Start failed: 0x%lx\n", hr);
+        return -1;
+    }
+    hr = captureClient_->Start();
+    if (FAILED(hr)) {
+        fprintf(stderr, "Capture Start failed: 0x%lx\n", hr);
+        return -1;
+    }
     running_.store(true);
 
     audioThread_ = std::thread(&WasapiAudio::audioLoop, this);
@@ -227,15 +181,15 @@ void WasapiAudio::stop() {
     if (audioThread_.joinable()) {
         audioThread_.join();
     }
+    timeEndPeriod(1);
     cleanup();
 }
 
 void WasapiAudio::audioLoop() {
-    float captureBuffer[AE_FRAME_SIZE * AE_CHANNELS];
-    float playbackBuffer[AE_FRAME_SIZE * AE_CHANNELS];
-
     while (running_.load()) {
         // ─── Capture ───
+        // With AUTOCONVERTPCM, data arrives as 48kHz stereo float32.
+        // Just memcpy directly into the engine -- no format conversion needed.
         UINT32 packetLength = 0;
         captureService_->GetNextPacketSize(&packetLength);
         while (packetLength > 0) {
@@ -245,11 +199,18 @@ void WasapiAudio::audioLoop() {
             HRESULT hr = captureService_->GetBuffer(&data, &framesAvailable, &flags, nullptr, nullptr);
             if (SUCCEEDED(hr)) {
                 if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                    memset(captureBuffer, 0, framesAvailable * AE_CHANNELS * sizeof(float));
-                } else if (framesAvailable <= AE_FRAME_SIZE) {
-                    convertCaptureToFloat(data, captureBuffer, framesAvailable);
+                    // Write silence for the exact number of frames
+                    float silence[AE_FRAME_SIZE * AE_CHANNELS] = {};
+                    UINT32 remaining = framesAvailable;
+                    while (remaining > 0) {
+                        UINT32 chunk = remaining < AE_FRAME_SIZE ? remaining : AE_FRAME_SIZE;
+                        ae_engine_write_capture(engine_, silence, chunk);
+                        remaining -= chunk;
+                    }
+                } else {
+                    // Data is already 48kHz stereo float32 thanks to AUTOCONVERTPCM
+                    ae_engine_write_capture(engine_, (const float *)data, framesAvailable);
                 }
-                ae_engine_write_capture(engine_, captureBuffer, framesAvailable);
                 captureService_->ReleaseBuffer(framesAvailable);
             }
             captureService_->GetNextPacketSize(&packetLength);
@@ -263,7 +224,8 @@ void WasapiAudio::audioLoop() {
         renderClient_->GetCurrentPadding(&padding);
         UINT32 framesAvailable = renderBufferSize_ - padding;
 
-        if (framesAvailable >= AE_FRAME_SIZE) {
+        // Write as many frames as the render buffer can accept
+        while (framesAvailable >= AE_FRAME_SIZE) {
             BYTE *data;
             HRESULT hr = renderService_->GetBuffer(AE_FRAME_SIZE, &data);
             if (SUCCEEDED(hr)) {
@@ -273,11 +235,14 @@ void WasapiAudio::audioLoop() {
                            (AE_FRAME_SIZE - framesRead) * AE_CHANNELS * sizeof(float));
                 }
                 renderService_->ReleaseBuffer(AE_FRAME_SIZE, 0);
+            } else {
+                break;
             }
+            framesAvailable -= AE_FRAME_SIZE;
         }
 
-        // Sleep ~10ms (half frame) to maintain timing
-        Sleep(10);
+        // Sleep ~5ms -- with timeBeginPeriod(1), this is accurate
+        Sleep(5);
     }
 }
 

@@ -32,6 +32,8 @@
 #define KEEPALIVE_INTERVAL_MS 5000
 #define PING_INTERVAL_MS      2000 /* RTT ping every 2 seconds */
 #define MAX_RECV_PER_TICK     20   /* max packets to process per tick */
+#define STREAM_TIMEOUT_MS     500  /* stop mixing after 500ms silence */
+#define STREAM_DESTROY_MS     5000 /* destroy stream after 5s silence */
 
 /* ─── Remote stream state ─────────────────────────────────────────── */
 
@@ -43,6 +45,7 @@ typedef struct {
     ae_rtp_seq_tracker_t seq_tracker;
     float              volume;        /* per-stream volume */
     float              volume_target; /* target volume (for atomic reads) */
+    uint64_t           last_recv_ms;  /* timestamp of last received packet */
 } remote_stream_t;
 
 /* ─── Channel state ───────────────────────────────────────────────── */
@@ -178,6 +181,7 @@ static remote_stream_t *create_stream(ae_engine_t *e, uint64_t client_id)
             memset(s, 0, sizeof(*s));
             s->client_id = client_id;
             s->active = 1;
+            s->last_recv_ms = ae_net_time_ms();
             s->volume = 1.0f;
             s->volume_target = 1.0f;
             s->decoder = ae_opus_decoder_create();
@@ -717,6 +721,7 @@ void ae_engine_process(ae_engine_t *engine)
                     /* Push decoded frame into jitter buffer */
                     ae_jitter_push(stream->jitter, engine->decode_frame,
                                    stream->seq_tracker.max_seq);
+                    stream->last_recv_ms = ae_net_time_ms();
                 }
                 break;
             }
@@ -770,29 +775,41 @@ void ae_engine_process(ae_engine_t *engine)
     /* ── Step 4: Pop from jitter buffers → Mix → Playback ring ─────── */
 
     int mix_count = 0;
+    uint64_t now_mix = ae_net_time_ms();
 
     for (int i = 0; i < AE_MAX_USERS_PER_CH; i++) {
         if (!engine->streams[i].active || !engine->streams[i].jitter)
             continue;
 
         remote_stream_t *s = &engine->streams[i];
+        uint64_t silence_ms = now_mix - s->last_recv_ms;
+
+        /* Destroy streams that have been silent too long */
+        if (silence_ms > STREAM_DESTROY_MS) {
+            destroy_stream(engine, s);
+            continue;
+        }
+
+        /* Skip mixing for streams that timed out (no recent packets) */
+        if (silence_ms > STREAM_TIMEOUT_MS) {
+            continue;
+        }
 
         /* Try to pop a frame from the jitter buffer */
         int pop_result = ae_jitter_pop(s->jitter, engine->stream_frames[mix_count]);
 
         if (pop_result < 0) {
-            /* Jitter buffer empty -- try PLC */
-            if (s->decoder) {
+            /* Jitter buffer empty -- try PLC for brief gaps only */
+            if (s->decoder && silence_ms < 200) {
                 int plc_result = ae_opus_decode_plc(s->decoder,
                                                      engine->stream_frames[mix_count]);
                 if (plc_result <= 0) {
-                    /* PLC failed -- use silence */
                     memset(engine->stream_frames[mix_count], 0,
                            AE_FRAME_SIZE * AE_CHANNELS * sizeof(float));
                 }
             } else {
-                memset(engine->stream_frames[mix_count], 0,
-                       AE_FRAME_SIZE * AE_CHANNELS * sizeof(float));
+                /* Too long without data -- just skip, don't mix silence */
+                continue;
             }
             atomic_fetch_add(&engine->buffer_underruns, 1);
         }
