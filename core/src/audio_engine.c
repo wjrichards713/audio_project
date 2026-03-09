@@ -579,11 +579,12 @@ void ae_engine_process(ae_engine_t *engine)
     /* ── Step 1: Capture → Encode → Encrypt → Send ─────────────────── */
 
     if (is_connected && atomic_load(&engine->transmitting)) {
-        /* Read one frame from capture ring buffer */
-        int cap_frames = ae_ringbuf_read(engine->capture_ring,
-                                         engine->capture_frame, AE_FRAME_SIZE);
+        /* Only read when a full frame is available (don't drain partial data) */
+        if (ae_ringbuf_available(engine->capture_ring) >= AE_FRAME_SIZE) {
+            int cap_frames = ae_ringbuf_read(engine->capture_ring,
+                                             engine->capture_frame, AE_FRAME_SIZE);
 
-        if (cap_frames == AE_FRAME_SIZE) {
+            if (cap_frames == AE_FRAME_SIZE) {
             /* Encode to Opus */
             int encoded_len = ae_opus_encode(engine->encoder,
                                              engine->capture_frame,
@@ -633,6 +634,7 @@ void ae_engine_process(ae_engine_t *engine)
                 }
             }
         }
+        } /* ae_ringbuf_available check */
     }
 
     /* ── Step 2: Receive → Decrypt → Decode → Jitter buffer ────────── */
@@ -652,7 +654,17 @@ void ae_engine_process(ae_engine_t *engine)
             if (ae_rtp_parse_header(engine->recv_buf, recv_len, &hdr) != 0)
                 continue;
 
-            /* Skip our own packets */
+            /* Handle PONG before self-filter (server echoes our client_id) */
+            if (hdr.packet_type == AE_RTP_TYPE_PONG) {
+                uint64_t now_pong = ae_net_time_ms();
+                if (engine->ping_send_time_ms > 0) {
+                    engine->rtt_ms = (float)(now_pong - engine->ping_send_time_ms);
+                    engine->ping_send_time_ms = 0;
+                }
+                continue;
+            }
+
+            /* Skip our own packets (audio, keepalive, etc.) */
             if (hdr.client_id == engine->client_id)
                 continue;
 
@@ -708,15 +720,7 @@ void ae_engine_process(ae_engine_t *engine)
                 /* Server keepalive -- nothing to do */
                 break;
 
-            case AE_RTP_TYPE_PONG: {
-                /* RTT measurement: compute from send timestamp */
-                uint64_t now_pong = ae_net_time_ms();
-                if (engine->ping_send_time_ms > 0) {
-                    engine->rtt_ms = (float)(now_pong - engine->ping_send_time_ms);
-                    engine->ping_send_time_ms = 0;
-                }
-                break;
-            }
+            /* PONG is handled above (before self-filter) */
 
             default:
                 break;
