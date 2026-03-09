@@ -3,6 +3,12 @@
  *
  * Win32 native GUI with channel controls, PTT buttons,
  * volume sliders, and live status display.
+ *
+ * Connection flow:
+ *   1. WebSocket connect + auth -> get client_id (UUID) and UDP port
+ *   2. UDP connect with engine (using client_id for routing headers)
+ *   3. All signaling (join/leave/talk/stop) goes over WebSocket
+ *   4. Audio data flows over UDP
  */
 
 #ifdef _WIN32
@@ -22,6 +28,7 @@
 #include <atomic>
 #include <string>
 #include <mutex>
+#include <thread>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -30,6 +37,7 @@ extern "C" {
 #include "audio_engine.h"
 }
 #include "wasapi_audio.h"
+#include "ws_signaling.h"
 
 /* ─── Server Configuration ──────────────────────────────────────── */
 #define DEFAULT_SERVER_HOST "34.219.36.101"
@@ -47,6 +55,7 @@ static bool channelMuted[3] = {};
 /* ─── Engine State ──────────────────────────────────────────────── */
 static ae_engine_t *g_engine = nullptr;
 static WasapiAudio *g_audio = nullptr;
+static WsSignaling *g_ws = nullptr;
 static std::atomic<bool> g_connected{false};
 static std::mutex g_logMutex;
 static std::wstring g_logText;
@@ -121,48 +130,47 @@ static void appendLogA(const char *msg) {
     appendLog(buf);
 }
 
-/* ─── Event Callback ────────────────────────────────────────────── */
-static void eventCallback(const ae_event_t *event, void * /*user_data*/) {
+/* ─── WebSocket Event Handler ───────────────────────────────────── */
+static void onWsEvent(const WsEvent &ev) {
     wchar_t buf[256];
-    switch (event->type) {
-        case AE_EVENT_CONNECTED:
-            g_connected.store(true);
-            appendLog(L"Connected to server");
-            PostMessage(g_hwnd, WM_APP + 1, 0, 0);
-            break;
-        case AE_EVENT_DISCONNECTED:
-            g_connected.store(false);
-            appendLog(L"Disconnected from server");
-            PostMessage(g_hwnd, WM_APP + 1, 0, 0);
-            break;
-        case AE_EVENT_USER_JOINED:
-            swprintf(buf, 256, L"User '%hs' joined %hs",
-                     event->user_name ? event->user_name : "unknown",
-                     event->channel_id ? event->channel_id : "?");
-            appendLog(buf);
-            break;
-        case AE_EVENT_USER_LEFT:
-            swprintf(buf, 256, L"User left %hs",
-                     event->channel_id ? event->channel_id : "?");
-            appendLog(buf);
-            break;
-        case AE_EVENT_USER_SPEAKING:
-            swprintf(buf, 256, L"User speaking in %hs",
-                     event->channel_id ? event->channel_id : "?");
-            appendLog(buf);
-            break;
-        case AE_EVENT_USER_STOPPED:
-            swprintf(buf, 256, L"User stopped in %hs",
-                     event->channel_id ? event->channel_id : "?");
-            appendLog(buf);
-            break;
-        case AE_EVENT_ERROR:
-            swprintf(buf, 256, L"Error: %hs",
-                     event->message ? event->message : "unknown");
-            appendLog(buf);
-            break;
-        default:
-            break;
+
+    if (ev.type == "user_joined") {
+        swprintf(buf, 256, L"[WS] User '%hs' joined %hs",
+                 ev.user_name.c_str(), ev.channel_id.c_str());
+        appendLog(buf);
+    }
+    else if (ev.type == "user_left") {
+        swprintf(buf, 256, L"[WS] User '%hs' left %hs",
+                 ev.client_id.c_str(), ev.channel_id.c_str());
+        appendLog(buf);
+    }
+    else if (ev.type == "user_speaking") {
+        swprintf(buf, 256, L"[WS] User speaking in %hs", ev.channel_id.c_str());
+        appendLog(buf);
+    }
+    else if (ev.type == "user_stopped") {
+        swprintf(buf, 256, L"[WS] User stopped in %hs", ev.channel_id.c_str());
+        appendLog(buf);
+    }
+    else if (ev.type == "channel_joined") {
+        swprintf(buf, 256, L"[WS] Server confirmed join: %hs", ev.channel_id.c_str());
+        appendLog(buf);
+    }
+    else if (ev.type == "channel_left") {
+        swprintf(buf, 256, L"[WS] Server confirmed leave: %hs", ev.channel_id.c_str());
+        appendLog(buf);
+    }
+    else if (ev.type == "error") {
+        swprintf(buf, 256, L"[WS] Server error: %hs", ev.message.c_str());
+        appendLog(buf);
+    }
+    else if (ev.type == "pong") {
+        // Could calculate RTT here
+    }
+    else if (ev.type == "disconnected") {
+        g_connected.store(false);
+        appendLog(L"[WS] Connection lost");
+        if (g_hwnd) PostMessage(g_hwnd, WM_APP + 1, 0, 0);
     }
 }
 
@@ -310,6 +318,46 @@ static void createUI(HWND hwnd) {
     SendMessage(g_logBox, WM_SETFONT, (WPARAM)g_fontSmall, TRUE);
 }
 
+/* ─── Connect (WS + UDP) on background thread ──────────────────── */
+static void doConnect() {
+    appendLog(L"Connecting WebSocket...");
+
+    if (!g_ws) g_ws = new WsSignaling();
+    g_ws->setEventCallback(onWsEvent);
+
+    if (!g_ws->connect(DEFAULT_SERVER_HOST, DEFAULT_WS_PORT, DEFAULT_AUTH_TOKEN)) {
+        appendLog(L"WebSocket connection failed!");
+        PostMessage(g_hwnd, WM_APP + 1, 0, 0);
+        return;
+    }
+
+    wchar_t buf[256];
+    swprintf(buf, 256, L"Authenticated: client=%hs (UDP ID: %llu)",
+             g_ws->getClientId().c_str(),
+             (unsigned long long)g_ws->getUdpClientId());
+    appendLog(buf);
+
+    // Set the client_id on the engine so UDP packets use the correct routing ID
+    ae_engine_set_client_id(g_engine, g_ws->getUdpClientId());
+
+    // Now connect UDP
+    appendLog(L"Connecting UDP...");
+    int result = ae_engine_connect(g_engine, DEFAULT_SERVER_HOST,
+                                    DEFAULT_UDP_PORT, DEFAULT_WS_PORT,
+                                    DEFAULT_AUTH_TOKEN);
+    if (result != AE_OK) {
+        swprintf(buf, 256, L"UDP connect failed: error %d", result);
+        appendLog(buf);
+        g_ws->disconnect();
+        PostMessage(g_hwnd, WM_APP + 1, 0, 0);
+        return;
+    }
+
+    g_connected.store(true);
+    appendLog(L"Connected! (WS + UDP)");
+    PostMessage(g_hwnd, WM_APP + 1, 0, 0);
+}
+
 /* ─── Window Procedure ──────────────────────────────────────────── */
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -352,21 +400,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         int id = LOWORD(wParam);
 
         if (id == ID_CONNECT_BTN) {
-            if (g_engine) {
-                appendLog(L"Connecting to " L"" DEFAULT_SERVER_HOST L"...");
-                int result = ae_engine_connect(g_engine, DEFAULT_SERVER_HOST,
-                                                DEFAULT_UDP_PORT, DEFAULT_WS_PORT,
-                                                DEFAULT_AUTH_TOKEN);
-                if (result != AE_OK) {
-                    wchar_t buf[128];
-                    swprintf(buf, 128, L"Connect failed: error %d", result);
-                    appendLog(buf);
-                }
+            if (g_engine && !g_connected.load()) {
+                EnableWindow(g_connectBtn, FALSE);
+                // Connect on background thread to avoid blocking UI
+                std::thread(doConnect).detach();
             }
         }
         else if (id == ID_DISCONNECT_BTN) {
             if (g_engine) {
                 ae_engine_disconnect(g_engine);
+                if (g_ws) g_ws->disconnect();
                 for (int i = 0; i < 3; i++) {
                     channelJoined[i] = false;
                     transmitting[i] = false;
@@ -381,18 +424,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         else if (id >= ID_CH1_JOIN && id <= ID_CH3_JOIN) {
             int idx = id - ID_CH1_JOIN;
             if (!channelJoined[idx]) {
-                int result = ae_engine_join_channel(g_engine, CHANNEL_IDS[idx]);
-                if (result == AE_OK) {
+                // Join via WebSocket signaling
+                if (g_ws && g_ws->joinChannel(CHANNEL_IDS[idx])) {
+                    // Also tell the engine (for local audio state)
+                    ae_engine_join_channel(g_engine, CHANNEL_IDS[idx]);
                     channelJoined[idx] = true;
                     wchar_t buf[128];
-                    swprintf(buf, 128, L"Joined %s", CHANNEL_NAMES[idx]);
-                    appendLog(buf);
-                } else {
-                    wchar_t buf[128];
-                    swprintf(buf, 128, L"Failed to join: error %d", result);
+                    swprintf(buf, 128, L"Joining %s...", CHANNEL_NAMES[idx]);
                     appendLog(buf);
                 }
             } else {
+                // Leave via WebSocket
+                if (g_ws) g_ws->leaveChannel(CHANNEL_IDS[idx]);
                 ae_engine_leave_channel(g_engine, CHANNEL_IDS[idx]);
                 channelJoined[idx] = false;
                 transmitting[idx] = false;
@@ -406,14 +449,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         else if (id >= ID_CH1_TALK && id <= ID_CH3_TALK) {
             int idx = id - ID_CH1_TALK;
             if (!transmitting[idx]) {
-                int result = ae_engine_start_transmit(g_engine, CHANNEL_IDS[idx]);
-                if (result == AE_OK) {
-                    transmitting[idx] = true;
-                    wchar_t buf[128];
-                    swprintf(buf, 128, L"Transmitting on %s", CHANNEL_NAMES[idx]);
-                    appendLog(buf);
-                }
+                // Start transmit via WS + engine
+                if (g_ws) g_ws->startTransmit(CHANNEL_IDS[idx]);
+                ae_engine_start_transmit(g_engine, CHANNEL_IDS[idx]);
+                transmitting[idx] = true;
+                wchar_t buf[128];
+                swprintf(buf, 128, L"Transmitting on %s", CHANNEL_NAMES[idx]);
+                appendLog(buf);
             } else {
+                // Stop transmit via WS + engine
+                if (g_ws) g_ws->stopTransmit(CHANNEL_IDS[idx]);
                 ae_engine_stop_transmit(g_engine, CHANNEL_IDS[idx]);
                 transmitting[idx] = false;
                 wchar_t buf[128];
@@ -471,6 +516,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 /* ─── Entry Point ───────────────────────────────────────────────── */
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
+    // Init Winsock early
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+
     // Init common controls for sliders
     INITCOMMONCONTROLSEX icex = {};
     icex.dwSize = sizeof(icex);
@@ -519,7 +568,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         MessageBoxW(g_hwnd, L"Failed to create audio engine", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
-    ae_engine_set_event_callback(g_engine, eventCallback, nullptr);
 
     // Start WASAPI audio
     g_audio = new WasapiAudio(g_engine);
@@ -528,7 +576,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     } else {
         appendLog(L"Audio engine started (48kHz stereo float32)");
     }
-    appendLog(L"Server: " L"" DEFAULT_SERVER_HOST);
+    appendLog(L"Server: " L"" DEFAULT_SERVER_HOST L" (WS:8080 UDP:10000)");
+    appendLog(L"Click Connect to start.");
 
     ShowWindow(g_hwnd, nCmdShow);
     UpdateWindow(g_hwnd);
@@ -541,6 +590,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     }
 
     // Cleanup
+    if (g_ws) {
+        g_ws->disconnect();
+        delete g_ws;
+    }
     if (g_audio) {
         g_audio->stop();
         delete g_audio;
@@ -556,6 +609,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     DeleteObject(g_bgBrush);
     DeleteObject(g_panelBrush);
 
+    WSACleanup();
     return (int)msg.wParam;
 }
 

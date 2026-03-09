@@ -133,7 +133,12 @@ struct ae_engine {
 static uint32_t channel_str_to_id(const char *str)
 {
     if (!str) return 0;
-    /* Simple hash for POC */
+    /* Server maps channel_id N -> "channel-N", so extract the trailing number.
+     * For "channel-1" -> 1, "channel-2" -> 2, etc. */
+    const char *dash = strrchr(str, '-');
+    if (dash && dash[1] >= '0' && dash[1] <= '9')
+        return (uint32_t)atoi(dash + 1);
+    /* Fallback: simple hash */
     uint32_t h = 5381;
     for (const char *p = str; *p; p++)
         h = ((h << 5) + h) + (uint32_t)*p;
@@ -798,4 +803,12 @@ ae_stats_t ae_engine_get_stats(const ae_engine_t *engine)
     }
 
     return stats;
+}
+
+/* ─── Client Identity ─────────────────────────────────────────────── */
+
+void ae_engine_set_client_id(ae_engine_t *engine, uint64_t client_id)
+{
+    if (engine)
+        engine->client_id = client_id;
 }

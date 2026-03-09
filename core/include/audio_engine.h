@@ -153,6 +153,13 @@ typedef struct {
 
 AE_API ae_stats_t ae_engine_get_stats(const ae_engine_t *engine);
 
+/* ─── Client Identity (set from WebSocket auth response) ───────────── */
+
+/** Set the numeric client ID used in UDP routing headers.
+ *  Must be called after ae_engine_connect() with the value derived
+ *  from the server's auth_ok response. */
+AE_API void ae_engine_set_client_id(ae_engine_t *engine, uint64_t client_id);
+
 #ifdef __cplusplus
 }
 #endif

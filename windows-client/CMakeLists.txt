@@ -52,6 +52,7 @@ set(COMMON_DEFINES
 add_executable(audio_client WIN32
     src/main_gui.cpp
     src/wasapi_audio.cpp
+    src/ws_signaling.cpp
     ${CORE_SOURCES}
 )
 
