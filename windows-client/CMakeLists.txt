@@ -20,7 +20,6 @@ if(NOT OPUS_FOUND)
     )
     FetchContent_MakeAvailable(opus)
     set(OPUS_LIBRARIES opus)
-    set(OPUS_INCLUDE_DIRS ${opus_SOURCE_DIR}/include)
 endif()
 
 # ─── Core audio engine library ─────────────────────────────────

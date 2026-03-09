@@ -8,7 +8,7 @@
 #include "opus_codec.h"
 #include "../include/audio_engine.h"
 
-#include <opus/opus.h>
+#include <opus.h>
 #include <stdlib.h>
 #include <string.h>
 
