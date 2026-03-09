@@ -686,12 +686,17 @@ void ae_engine_process(ae_engine_t *engine)
                                                             recv_len);
                 if (!payload) break;
 
-                /* Decrypt */
+                /* Decrypt -- AAD must match encrypt side (payload_length=0) */
+                uint8_t aad_buf[AE_RTP_HEADER_SIZE];
+                memcpy(aad_buf, engine->recv_buf, AE_RTP_HEADER_SIZE);
+                aad_buf[18] = 0;  /* zero payload_length to match encrypt AAD */
+                aad_buf[19] = 0;
+
                 uint8_t decrypted[AE_MAX_PACKET_SIZE];
                 int decrypted_len = ae_crypto_decrypt(
                     engine->crypto,
                     hdr.channel_id,
-                    engine->recv_buf, AE_RTP_HEADER_SIZE,  /* AAD */
+                    aad_buf, AE_RTP_HEADER_SIZE,  /* AAD with payload_length=0 */
                     payload, hdr.payload_length,
                     decrypted, sizeof(decrypted)
                 );
