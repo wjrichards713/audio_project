@@ -23,7 +23,7 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <stdatomic.h>
+#include "atomic_compat.h"
 
 /* ─── Constants ───────────────────────────────────────────────────── */
 

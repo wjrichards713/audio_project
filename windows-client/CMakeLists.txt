@@ -36,6 +36,7 @@ add_executable(audio_client
 
 target_include_directories(audio_client PRIVATE
     ${CORE_DIR}/include
+    ${CORE_DIR}/src
     ${OPUS_INCLUDE_DIRS}
 )
 
@@ -51,3 +52,8 @@ target_compile_definitions(audio_client PRIVATE
     _WIN32_WINNT=0x0A00
     NOMINMAX
 )
+
+# MSVC does not support C11 <stdatomic.h> -- force all .c files to compile as C++
+if(MSVC)
+    target_compile_options(audio_client PRIVATE /TP)
+endif()
