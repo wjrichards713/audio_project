@@ -51,9 +51,5 @@ target_compile_definitions(audio_client PRIVATE
     AE_PLATFORM_WINDOWS=1
     _WIN32_WINNT=0x0A00
     NOMINMAX
+    AE_BUILDING_DLL
 )
-
-# MSVC does not support C11 <stdatomic.h> -- force all .c files to compile as C++
-if(MSVC)
-    target_compile_options(audio_client PRIVATE /TP)
-endif()

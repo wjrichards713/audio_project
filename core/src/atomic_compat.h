@@ -2,12 +2,10 @@
  * @file atomic_compat.h
  * @brief Cross-platform atomic operations compatibility.
  *
- * MSVC does not support C11 <stdatomic.h>, and its <atomic> C++ header
- * internally includes the broken C11 header.  So on MSVC we use
- * <intrin.h> Interlocked intrinsics directly.
- *
- * Requires /TP flag on MSVC (compile .c files as C++) for overloaded
- * inline functions.
+ * MSVC does not support C11 <stdatomic.h>.  On MSVC we use
+ * <intrin.h> Interlocked intrinsics directly, with sizeof-based
+ * macro dispatch for 32-bit vs 64-bit operations (pure C, no
+ * C++ overloading required).
  *
  * On GCC/Clang, standard C11 <stdatomic.h> is used directly.
  */
@@ -39,36 +37,49 @@ typedef volatile __int64   atomic_uint_fast64_t;
 #define atomic_store(ptr, val)  (void)(*(ptr) = (val))
 #define atomic_load(ptr)        (*(ptr))
 
-/* ─── Overloaded Interlocked wrappers (32-bit and 64-bit) ─────── */
+/* ─── Named helper functions (no overloading -- pure C) ────────── */
 
-static __forceinline long _ae_fetch_add(volatile long *p, long v)
+static __forceinline long _ae_fetch_add32(volatile long *p, long v)
 { return _InterlockedExchangeAdd(p, v); }
 
-static __forceinline __int64 _ae_fetch_add(volatile __int64 *p, __int64 v)
+static __forceinline __int64 _ae_fetch_add64(volatile __int64 *p, __int64 v)
 { return _InterlockedExchangeAdd64(p, v); }
 
-static __forceinline long _ae_fetch_sub(volatile long *p, long v)
+static __forceinline long _ae_fetch_sub32(volatile long *p, long v)
 { return _InterlockedExchangeAdd(p, -v); }
 
-static __forceinline __int64 _ae_fetch_sub(volatile __int64 *p, __int64 v)
+static __forceinline __int64 _ae_fetch_sub64(volatile __int64 *p, __int64 v)
 { return _InterlockedExchangeAdd64(p, -v); }
 
-static __forceinline long _ae_exchange(volatile long *p, long v)
+static __forceinline long _ae_exchange32(volatile long *p, long v)
 { return _InterlockedExchange(p, v); }
 
-static __forceinline __int64 _ae_exchange(volatile __int64 *p, __int64 v)
+static __forceinline __int64 _ae_exchange64(volatile __int64 *p, __int64 v)
 { return _InterlockedExchange64(p, v); }
 
-/* ─── Macro API matching C11 <stdatomic.h> names ─────────────── */
-#define atomic_fetch_add(ptr, val)  _ae_fetch_add((ptr), (val))
-#define atomic_fetch_sub(ptr, val)  _ae_fetch_sub((ptr), (val))
+/* ─── sizeof-based dispatch macros (works in C and C++) ────────── */
 
-/* Explicit variants (memory order argument is ignored) */
+#define atomic_fetch_add(ptr, val) \
+    (sizeof(*(ptr)) == 8 \
+        ? _ae_fetch_add64((volatile __int64*)(ptr), (__int64)(val)) \
+        : _ae_fetch_add32((volatile long*)(ptr), (long)(val)))
+
+#define atomic_fetch_sub(ptr, val) \
+    (sizeof(*(ptr)) == 8 \
+        ? _ae_fetch_sub64((volatile __int64*)(ptr), (__int64)(val)) \
+        : _ae_fetch_sub32((volatile long*)(ptr), (long)(val)))
+
+#define _ae_exchange_dispatch(ptr, val) \
+    (sizeof(*(ptr)) == 8 \
+        ? _ae_exchange64((volatile __int64*)(ptr), (__int64)(val)) \
+        : _ae_exchange32((volatile long*)(ptr), (long)(val)))
+
+/* ─── Explicit variants (memory order argument is ignored) ─────── */
 #define atomic_store_explicit(ptr, val, order)      atomic_store(ptr, val)
 #define atomic_load_explicit(ptr, order)            atomic_load(ptr)
 #define atomic_fetch_add_explicit(ptr, val, order)  atomic_fetch_add(ptr, val)
 #define atomic_fetch_sub_explicit(ptr, val, order)  atomic_fetch_sub(ptr, val)
-#define atomic_exchange_explicit(ptr, val, order)   _ae_exchange((ptr), (long)(val))
+#define atomic_exchange_explicit(ptr, val, order)   _ae_exchange_dispatch(ptr, val)
 
 #define ATOMIC_VAR_INIT(val) (val)
 
