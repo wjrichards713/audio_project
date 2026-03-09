@@ -254,9 +254,9 @@ ae_engine_t *ae_engine_create(const ae_config_t *config)
         return NULL;
     }
 
-    /* Create ring buffers */
-    e->capture_ring = ae_ringbuf_create(CAPTURE_RING_FRAMES, AE_CHANNELS);
-    e->playback_ring = ae_ringbuf_create(PLAYBACK_RING_FRAMES, AE_CHANNELS);
+    /* Create ring buffers (capacity in sample-frames, not engine frames) */
+    e->capture_ring = ae_ringbuf_create(CAPTURE_RING_FRAMES * AE_FRAME_SIZE, AE_CHANNELS);
+    e->playback_ring = ae_ringbuf_create(PLAYBACK_RING_FRAMES * AE_FRAME_SIZE, AE_CHANNELS);
     if (!e->capture_ring || !e->playback_ring) {
         ae_engine_destroy(e);
         return NULL;
