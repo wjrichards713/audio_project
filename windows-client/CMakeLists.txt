@@ -26,29 +26,46 @@ endif()
 set(CORE_DIR "${CMAKE_SOURCE_DIR}/../core")
 file(GLOB CORE_SOURCES "${CORE_DIR}/src/*.c")
 
-# ─── Windows client ────────────────────────────────────────────
-add_executable(audio_client
-    src/main.cpp
-    src/wasapi_audio.cpp
-    ${CORE_SOURCES}
-)
-
-target_include_directories(audio_client PRIVATE
+# ─── Common settings ──────────────────────────────────────────
+set(COMMON_INCLUDES
     ${CORE_DIR}/include
     ${CORE_DIR}/src
     ${OPUS_INCLUDE_DIRS}
 )
 
-target_link_libraries(audio_client
+set(COMMON_LIBS
     ${OPUS_LIBRARIES}
     ws2_32       # Winsock
     ole32        # COM (for WASAPI)
     uuid         # COM GUIDs
+    comctl32     # Common controls (sliders, etc.)
 )
 
-target_compile_definitions(audio_client PRIVATE
+set(COMMON_DEFINES
     AE_PLATFORM_WINDOWS=1
     _WIN32_WINNT=0x0A00
     NOMINMAX
     AE_BUILDING_DLL
 )
+
+# ─── GUI client (main build target) ──────────────────────────
+add_executable(audio_client WIN32
+    src/main_gui.cpp
+    src/wasapi_audio.cpp
+    ${CORE_SOURCES}
+)
+
+target_include_directories(audio_client PRIVATE ${COMMON_INCLUDES})
+target_link_libraries(audio_client ${COMMON_LIBS})
+target_compile_definitions(audio_client PRIVATE ${COMMON_DEFINES})
+
+# ─── Console client (for debugging) ──────────────────────────
+add_executable(audio_client_cli
+    src/main.cpp
+    src/wasapi_audio.cpp
+    ${CORE_SOURCES}
+)
+
+target_include_directories(audio_client_cli PRIVATE ${COMMON_INCLUDES})
+target_link_libraries(audio_client_cli ${COMMON_LIBS})
+target_compile_definitions(audio_client_cli PRIVATE ${COMMON_DEFINES})
