@@ -101,25 +101,41 @@ int WasapiAudio::openCaptureDevice() {
     hr = captureDevice_->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void **)&captureClient_);
     if (FAILED(hr)) return -1;
 
-    WAVEFORMATEXTENSIBLE wfx = {};
-    wfx.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
-    wfx.Format.nChannels = AE_CHANNELS;
-    wfx.Format.nSamplesPerSec = AE_SAMPLE_RATE;
-    wfx.Format.wBitsPerSample = 32;
-    wfx.Format.nBlockAlign = wfx.Format.nChannels * wfx.Format.wBitsPerSample / 8;
-    wfx.Format.nAvgBytesPerSec = wfx.Format.nSamplesPerSec * wfx.Format.nBlockAlign;
-    wfx.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-    wfx.Samples.wValidBitsPerSample = 32;
-    wfx.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
-    wfx.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+    // Use the device's preferred mix format (shared mode requires this)
+    WAVEFORMATEX *mixFormat = nullptr;
+    hr = captureClient_->GetMixFormat(&mixFormat);
+    if (FAILED(hr)) {
+        fprintf(stderr, "Failed to get capture mix format: 0x%lx\n", hr);
+        return -1;
+    }
+
+    // Store format info for runtime conversion
+    captureSampleRate_ = mixFormat->nSamplesPerSec;
+    captureChannels_ = mixFormat->nChannels;
+    captureBitsPerSample_ = mixFormat->wBitsPerSample;
+    captureIsFloat_ = false;
+
+    if (mixFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+        captureIsFloat_ = true;
+    } else if (mixFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        WAVEFORMATEXTENSIBLE *wfxe = (WAVEFORMATEXTENSIBLE *)mixFormat;
+        if (IsEqualGUID(wfxe->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) {
+            captureIsFloat_ = true;
+        }
+    }
+
+    printf("Capture device format: %uHz, %uch, %ubit, %s\n",
+           captureSampleRate_, captureChannels_, captureBitsPerSample_,
+           captureIsFloat_ ? "float" : "int");
 
     REFERENCE_TIME duration = AE_FRAME_DURATION_MS * REFTIMES_PER_MILLISEC * 2;
 
     hr = captureClient_->Initialize(
         AUDCLNT_SHAREMODE_SHARED, 0,
         duration, 0,
-        (WAVEFORMATEX *)&wfx, nullptr
+        mixFormat, nullptr
     );
+    CoTaskMemFree(mixFormat);
     if (FAILED(hr)) {
         fprintf(stderr, "Failed to init capture client: 0x%lx\n", hr);
         return -1;
@@ -133,6 +149,61 @@ int WasapiAudio::openCaptureDevice() {
 
     printf("Capture device opened: buffer=%u frames\n", captureBufferSize_);
     return 0;
+}
+
+void WasapiAudio::convertCaptureToFloat(const BYTE *src, float *dst, UINT32 frames) {
+    UINT32 totalSamples = frames * captureChannels_;
+    UINT32 outSamples = frames * AE_CHANNELS;
+
+    if (captureIsFloat_ && captureBitsPerSample_ == 32) {
+        // Float32 source -- just handle channel mapping
+        const float *fsrc = (const float *)src;
+        if (captureChannels_ == AE_CHANNELS) {
+            memcpy(dst, fsrc, outSamples * sizeof(float));
+        } else {
+            // Downmix or upmix to stereo
+            for (UINT32 f = 0; f < frames; f++) {
+                if (captureChannels_ >= 2) {
+                    dst[f * 2 + 0] = fsrc[f * captureChannels_ + 0];
+                    dst[f * 2 + 1] = fsrc[f * captureChannels_ + 1];
+                } else {
+                    dst[f * 2 + 0] = fsrc[f * captureChannels_];
+                    dst[f * 2 + 1] = fsrc[f * captureChannels_];
+                }
+            }
+        }
+    } else if (captureBitsPerSample_ == 16) {
+        // 16-bit PCM source
+        const short *ssrc = (const short *)src;
+        for (UINT32 f = 0; f < frames; f++) {
+            if (captureChannels_ >= 2) {
+                dst[f * 2 + 0] = ssrc[f * captureChannels_ + 0] / 32768.0f;
+                dst[f * 2 + 1] = ssrc[f * captureChannels_ + 1] / 32768.0f;
+            } else {
+                float s = ssrc[f * captureChannels_] / 32768.0f;
+                dst[f * 2 + 0] = s;
+                dst[f * 2 + 1] = s;
+            }
+        }
+    } else if (captureBitsPerSample_ == 24) {
+        // 24-bit PCM source (packed 3 bytes per sample)
+        for (UINT32 f = 0; f < frames; f++) {
+            for (UINT32 c = 0; c < (captureChannels_ < 2 ? 1u : 2u); c++) {
+                UINT32 srcIdx = (f * captureChannels_ + c) * 3;
+                int32_t sample = (int32_t)((src[srcIdx] << 8) | (src[srcIdx + 1] << 16) | (src[srcIdx + 2] << 24)) >> 8;
+                float val = sample / 8388608.0f;
+                if (c == 0 || captureChannels_ >= 2) {
+                    dst[f * 2 + c] = val;
+                }
+            }
+            if (captureChannels_ < 2) {
+                dst[f * 2 + 1] = dst[f * 2 + 0];
+            }
+        }
+    } else {
+        // Unsupported format, output silence
+        memset(dst, 0, outSamples * sizeof(float));
+    }
 }
 
 int WasapiAudio::start() {
@@ -175,11 +246,8 @@ void WasapiAudio::audioLoop() {
             if (SUCCEEDED(hr)) {
                 if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
                     memset(captureBuffer, 0, framesAvailable * AE_CHANNELS * sizeof(float));
-                } else {
-                    size_t bytes = framesAvailable * AE_CHANNELS * sizeof(float);
-                    if (bytes <= sizeof(captureBuffer)) {
-                        memcpy(captureBuffer, data, bytes);
-                    }
+                } else if (framesAvailable <= AE_FRAME_SIZE) {
+                    convertCaptureToFloat(data, captureBuffer, framesAvailable);
                 }
                 ae_engine_write_capture(engine_, captureBuffer, framesAvailable);
                 captureService_->ReleaseBuffer(framesAvailable);
